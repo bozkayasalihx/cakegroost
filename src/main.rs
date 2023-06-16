@@ -1,407 +1,426 @@
-use std::f32::consts::PI;
+use bevy::{
+    prelude::*,
+    sprite::collide_aabb::{collide, Collision},
+    sprite::MaterialMesh2dBundle,
+};
 
-use bevy::prelude::*;
-use rand::Rng;
+// Defines the amount of time that should elapse between each physics step.
+const TIME_STEP: f32 = 1.0 / 60.0;
 
-#[derive(Clone, Eq, PartialEq, Debug, Hash, Default, States)]
-enum GameState {
-    #[default]
-    Playing,
-    GameOver,
-}
+// These constants are defined in `Transform` units.
+// Using the default 2D camera they correspond 1:1 with screen pixels.
+const PADDLE_SIZE: Vec3 = Vec3::new(120.0, 20.0, 0.0);
+const GAP_BETWEEN_PADDLE_AND_FLOOR: f32 = 60.0;
+const PADDLE_SPEED: f32 = 500.0;
+// How close can the paddle get to the wall
+const PADDLE_PADDING: f32 = 10.0;
 
-#[derive(Resource)]
-struct BonusSpawnTimer(Timer);
+// We set the z-value of the ball to 1 so it renders on top in the case of overlapping sprites.
+const BALL_STARTING_POSITION: Vec3 = Vec3::new(0.0, -50.0, 1.0);
+const BALL_SIZE: Vec3 = Vec3::new(30.0, 30.0, 0.0);
+const BALL_SPEED: f32 = 400.0;
+const INITIAL_BALL_DIRECTION: Vec2 = Vec2::new(0.5, -0.5);
+
+const WALL_THICKNESS: f32 = 10.0;
+// x coordinates
+const LEFT_WALL: f32 = -450.;
+const RIGHT_WALL: f32 = 450.;
+// y coordinates
+const BOTTOM_WALL: f32 = -300.;
+const TOP_WALL: f32 = 300.;
+
+const BRICK_SIZE: Vec2 = Vec2::new(100., 30.);
+// These values are exact
+const GAP_BETWEEN_PADDLE_AND_BRICKS: f32 = 270.0;
+const GAP_BETWEEN_BRICKS: f32 = 5.0;
+// These values are lower bounds, as the number of bricks is computed
+const GAP_BETWEEN_BRICKS_AND_CEILING: f32 = 20.0;
+const GAP_BETWEEN_BRICKS_AND_SIDES: f32 = 20.0;
+
+const SCOREBOARD_FONT_SIZE: f32 = 40.0;
+const SCOREBOARD_TEXT_PADDING: Val = Val::Px(5.0);
+
+const BACKGROUND_COLOR: Color = Color::rgb(0.9, 0.9, 0.9);
+const PADDLE_COLOR: Color = Color::rgb(0.3, 0.3, 0.7);
+const BALL_COLOR: Color = Color::rgb(1.0, 0.5, 0.5);
+const BRICK_COLOR: Color = Color::rgb(0.5, 0.5, 1.0);
+const WALL_COLOR: Color = Color::rgb(0.8, 0.8, 0.8);
+const TEXT_COLOR: Color = Color::rgb(0.5, 0.5, 1.0);
+const SCORE_COLOR: Color = Color::rgb(1.0, 0.5, 0.5);
 
 fn main() {
     App::new()
-        .init_resource::<Game>()
-        .insert_resource(BonusSpawnTimer(Timer::from_seconds(
-            5.0,
-            TimerMode::Repeating,
-        )))
         .add_plugins(DefaultPlugins)
-        .add_state::<GameState>()
-        .add_systems((
-            setup_cameras.on_startup(),
-            setup.in_schedule(OnEnter(GameState::Playing)),
-        ))
+        .insert_resource(Board { score: 0, fps: 0 })
+        .insert_resource(ClearColor(BACKGROUND_COLOR))
+        .add_startup_system(setup)
+        .add_event::<CollisionEvent>()
+        // Add our gameplay simulation systems to the fixed timestep schedule
         .add_systems(
             (
-                move_player,
-                focus_camera,
-                rotate_bonus,
-                scoreboard_system,
-                spawn_bonus,
+                check_for_collisions,
+                apply_velocity.before(check_for_collisions),
+                move_paddle
+                    .before(check_for_collisions)
+                    .after(apply_velocity),
+                play_collision_sound.after(check_for_collisions),
             )
-                .in_set(OnUpdate(GameState::Playing)),
+                .in_schedule(CoreSchedule::FixedUpdate),
         )
-        .add_systems((
-            teardown.in_schedule(OnExit(GameState::Playing)),
-            display_score.in_schedule(OnEnter(GameState::GameOver)),
-            gameover_keyboard.in_set(OnUpdate(GameState::GameOver)),
-            teardown.in_schedule(OnExit(GameState::GameOver)),
-        ))
+        // Configure how frequently our gameplay systems are run
+        .insert_resource(FixedTime::new_from_secs(TIME_STEP))
+        .add_system(update_scoreboard)
+        .add_system(update_fps)
         .add_system(bevy::window::close_on_esc)
         .run();
 }
 
-struct Cell {
-    height: f32,
-}
+#[derive(Component)]
+struct Paddle;
+
+#[derive(Component)]
+struct Ball;
+
+#[derive(Component, Deref, DerefMut)]
+struct Velocity(Vec2);
+
+#[derive(Component)]
+struct Collider;
 
 #[derive(Default)]
-struct Player {
-    entity: Option<Entity>,
-    i: usize,
-    j: usize,
-    move_cooldown: Timer,
+struct CollisionEvent;
+
+#[derive(Component)]
+struct Brick;
+
+#[derive(Resource)]
+struct CollisionSound(Handle<AudioSource>);
+
+// This bundle is a collection of the components that define a "wall" in our game
+#[derive(Bundle)]
+struct WallBundle {
+    // You can nest bundles inside of other bundles like this
+    // Allowing you to compose their functionality
+    sprite_bundle: SpriteBundle,
+    collider: Collider,
 }
 
-#[derive(Default)]
-struct Bonus {
-    entity: Option<Entity>,
-    i: usize,
-    j: usize,
-    handle: Handle<Scene>,
+/// Which side of the arena is this wall located on?
+enum WallLocation {
+    Left,
+    Right,
+    Bottom,
+    Top,
 }
 
-#[derive(Resource, Default)]
-struct Game {
-    board: Vec<Vec<Cell>>,
-    player: Player,
-    bonus: Bonus,
-    score: i32,
-    cake_eaten: u32,
-    camera_should_focus: Vec3,
-    camera_is_focus: Vec3,
+impl WallLocation {
+    fn position(&self) -> Vec2 {
+        match self {
+            WallLocation::Left => Vec2::new(LEFT_WALL, 0.),
+            WallLocation::Right => Vec2::new(RIGHT_WALL, 0.),
+            WallLocation::Bottom => Vec2::new(0., BOTTOM_WALL),
+            WallLocation::Top => Vec2::new(0., TOP_WALL),
+        }
+    }
+
+    fn size(&self) -> Vec2 {
+        let arena_height = TOP_WALL - BOTTOM_WALL;
+        let arena_width = RIGHT_WALL - LEFT_WALL;
+        // Make sure we haven't messed up our constants
+        assert!(arena_height > 0.0);
+        assert!(arena_width > 0.0);
+
+        match self {
+            WallLocation::Left | WallLocation::Right => {
+                Vec2::new(WALL_THICKNESS, arena_height + WALL_THICKNESS)
+            }
+            WallLocation::Bottom | WallLocation::Top => {
+                Vec2::new(arena_width + WALL_THICKNESS, WALL_THICKNESS)
+            }
+        }
+    }
 }
 
-const BOARD_SIZE_I: usize = 14;
-const BOARD_SIZE_J: usize = 21;
-
-const RESET_FOCUS: [f32; 3] = [
-    BOARD_SIZE_I as f32 / 2.0,
-    0.0,
-    BOARD_SIZE_J as f32 / 2.0 - 0.5,
-];
-
-fn setup_cameras(mut commands: Commands, mut game: ResMut<Game>) {
-    game.camera_should_focus = Vec3::from(RESET_FOCUS);
-    game.camera_is_focus = game.camera_should_focus;
-    commands.spawn(Camera3dBundle {
-        transform: Transform::from_xyz(
-            -(BOARD_SIZE_I as f32 / 2.0),
-            2.0 * BOARD_SIZE_J as f32 / 3.0,
-            BOARD_SIZE_J as f32 / 2.0 - 0.5,
-        )
-        .looking_at(game.camera_is_focus, Vec3::Y),
-        ..default()
-    });
-}
-
-fn setup(mut commands: Commands, asset_server: Res<AssetServer>, mut game: ResMut<Game>) {
-    // reset the game state
-    game.cake_eaten = 0;
-    game.score = 0;
-    game.player.i = BOARD_SIZE_I / 2;
-    game.player.j = BOARD_SIZE_J / 2;
-    game.player.move_cooldown = Timer::from_seconds(0.3, TimerMode::Once);
-
-    commands.spawn(PointLightBundle {
-        transform: Transform::from_xyz(4.0, 10.0, 4.0),
-        point_light: PointLight {
-            intensity: 3000.0,
-            shadows_enabled: true,
-            range: 30.0,
-            ..default()
-        },
-        ..default()
-    });
-
-    // spawn the game board
-    let cell_scene = asset_server.load("models/tile.glb#Scene0");
-    game.board = (0..BOARD_SIZE_J)
-        .map(|j| {
-            (0..BOARD_SIZE_I)
-                .map(|i| {
-                    let height = rand::thread_rng().gen_range(-0.1..0.1);
-                    commands.spawn(SceneBundle {
-                        transform: Transform::from_xyz(i as f32, height - 0.2, j as f32),
-                        scene: cell_scene.clone(),
-                        ..default()
-                    });
-                    Cell { height }
-                })
-                .collect()
-        })
-        .collect();
-
-    // spawn the game character
-    game.player.entity = Some(
-        commands
-            .spawn(SceneBundle {
+impl WallBundle {
+    // This "builder method" allows us to reuse logic across our wall entities,
+    // making our code easier to read and less prone to bugs when we change the logic
+    fn new(location: WallLocation) -> WallBundle {
+        WallBundle {
+            sprite_bundle: SpriteBundle {
                 transform: Transform {
-                    translation: Vec3::new(
-                        game.player.i as f32,
-                        game.board[game.player.j][game.player.i].height,
-                        game.player.j as f32,
-                    ),
-                    rotation: Quat::from_rotation_y(-PI / 2.),
+                    // We need to convert our Vec2 into a Vec3, by giving it a z-coordinate
+                    // This is used to determine the order of our sprites
+                    translation: location.position().extend(0.0),
+                    // The z-scale of 2D objects must always be 1.0,
+                    // or their ordering will be affected in surprising ways.
+                    // See https://github.com/bevyengine/bevy/issues/4149
+                    scale: location.size().extend(1.0),
                     ..default()
                 },
-                scene: asset_server.load("models/alien.glb#Scene0"),
+                sprite: Sprite {
+                    color: WALL_COLOR,
+                    ..default()
+                },
                 ..default()
-            })
-            .id(),
-    );
-
-    // load the scene for the cake
-    game.bonus.handle = asset_server.load("models/cakeBirthday.glb#Scene0");
-
-    // scoreboard
-    commands.spawn(
-        TextBundle::from_section(
-            "Score:",
-            TextStyle {
-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
-                font_size: 40.0,
-                color: Color::rgb(0.5, 0.5, 1.0),
             },
-        )
+            collider: Collider,
+        }
+    }
+}
+
+// This resource tracks the game's score
+#[derive(Resource)]
+struct Board {
+    score: usize,
+    fps: usize,
+}
+
+// Add the game's entities to our world
+fn setup(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    asset_server: Res<AssetServer>,
+) {
+    // Camera
+    commands.spawn(Camera2dBundle::default());
+
+    // Sound
+    let ball_collision_sound = asset_server.load("sounds/breakout_collision.ogg");
+    commands.insert_resource(CollisionSound(ball_collision_sound));
+
+    // Paddle
+    let paddle_y = BOTTOM_WALL + GAP_BETWEEN_PADDLE_AND_FLOOR;
+
+    commands.spawn((
+        SpriteBundle {
+            transform: Transform {
+                translation: Vec3::new(0.0, paddle_y, 0.0),
+                scale: PADDLE_SIZE,
+                ..default()
+            },
+            sprite: Sprite {
+                color: PADDLE_COLOR,
+                ..default()
+            },
+            ..default()
+        },
+        Paddle,
+        Collider,
+    ));
+
+    // Ball
+    commands.spawn((
+        MaterialMesh2dBundle {
+            mesh: meshes.add(shape::Circle::default().into()).into(),
+            material: materials.add(ColorMaterial::from(BALL_COLOR)),
+            transform: Transform::from_translation(BALL_STARTING_POSITION).with_scale(BALL_SIZE),
+            ..default()
+        },
+        Ball,
+        Velocity(INITIAL_BALL_DIRECTION.normalize() * BALL_SPEED),
+    ));
+
+    // Scoreboard
+    commands.spawn(
+        TextBundle::from_sections([
+            TextSection::new(
+                "Score: ",
+                TextStyle {
+                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+                    font_size: SCOREBOARD_FONT_SIZE,
+                    color: TEXT_COLOR,
+                },
+            ),
+            TextSection::from_style(TextStyle {
+                font: asset_server.load("fonts/FiraMono-Medium.ttf"),
+                font_size: SCOREBOARD_FONT_SIZE,
+                color: SCORE_COLOR,
+            }),
+        ])
         .with_style(Style {
             position_type: PositionType::Absolute,
             position: UiRect {
-                top: Val::Px(5.0),
-                left: Val::Px(5.0),
+                top: SCOREBOARD_TEXT_PADDING,
+                left: SCOREBOARD_TEXT_PADDING,
                 ..default()
             },
             ..default()
         }),
     );
-}
 
-// remove all entities that are not a camera
-fn teardown(mut commands: Commands, entities: Query<Entity, Without<Camera>>) {
-    for entity in &entities {
-        commands.entity(entity).despawn();
-    }
-}
+    // Walls
+    commands.spawn(WallBundle::new(WallLocation::Left));
+    commands.spawn(WallBundle::new(WallLocation::Right));
+    commands.spawn(WallBundle::new(WallLocation::Bottom));
+    commands.spawn(WallBundle::new(WallLocation::Top));
 
-// control the game character
-fn move_player(
-    mut commands: Commands,
-    keyboard_input: Res<Input<KeyCode>>,
-    mut game: ResMut<Game>,
-    mut transforms: Query<&mut Transform>,
-    time: Res<Time>,
-) {
-    if game.player.move_cooldown.tick(time.delta()).finished() {
-        let mut moved = false;
-        let mut rotation = 0.0;
+    // Bricks
+    // Negative scales result in flipped sprites / meshes,
+    // which is definitely not what we want here
+    assert!(BRICK_SIZE.x > 0.0);
+    assert!(BRICK_SIZE.y > 0.0);
 
-        if keyboard_input.pressed(KeyCode::Up) {
-            if game.player.i < BOARD_SIZE_I - 1 {
-                game.player.i += 1;
-            }
-            rotation = -PI / 2.;
-            moved = true;
-        }
-        if keyboard_input.pressed(KeyCode::Down) {
-            if game.player.i > 0 {
-                game.player.i -= 1;
-            }
-            rotation = PI / 2.;
-            moved = true;
-        }
-        if keyboard_input.pressed(KeyCode::Right) {
-            if game.player.j < BOARD_SIZE_J - 1 {
-                game.player.j += 1;
-            }
-            rotation = PI;
-            moved = true;
-        }
-        if keyboard_input.pressed(KeyCode::Left) {
-            if game.player.j > 0 {
-                game.player.j -= 1;
-            }
-            rotation = 0.0;
-            moved = true;
-        }
+    let total_width_of_bricks = (RIGHT_WALL - LEFT_WALL) - 2. * GAP_BETWEEN_BRICKS_AND_SIDES;
+    let bottom_edge_of_bricks = paddle_y + GAP_BETWEEN_PADDLE_AND_BRICKS;
+    let total_height_of_bricks = TOP_WALL - bottom_edge_of_bricks - GAP_BETWEEN_BRICKS_AND_CEILING;
 
-        // move on the board
-        if moved {
-            game.player.move_cooldown.reset();
-            *transforms.get_mut(game.player.entity.unwrap()).unwrap() = Transform {
-                translation: Vec3::new(
-                    game.player.i as f32,
-                    game.board[game.player.j][game.player.i].height,
-                    game.player.j as f32,
-                ),
-                rotation: Quat::from_rotation_y(rotation),
-                ..default()
-            };
-        }
-    }
+    assert!(total_width_of_bricks > 0.0);
+    assert!(total_height_of_bricks > 0.0);
 
-    // eat the cake!
-    if let Some(entity) = game.bonus.entity {
-        if game.player.i == game.bonus.i && game.player.j == game.bonus.j {
-            game.score += 2;
-            game.cake_eaten += 1;
-            commands.entity(entity).despawn_recursive();
-            game.bonus.entity = None;
-        }
-    }
-}
+    // Given the space available, compute how many rows and columns of bricks we can fit
+    let n_columns = (total_width_of_bricks / (BRICK_SIZE.x + GAP_BETWEEN_BRICKS)).floor() as usize;
+    let n_rows = (total_height_of_bricks / (BRICK_SIZE.y + GAP_BETWEEN_BRICKS)).floor() as usize;
+    let n_vertical_gaps = n_columns - 1;
 
-// change the focus of the camera
-fn focus_camera(
-    time: Res<Time>,
-    mut game: ResMut<Game>,
-    mut transforms: ParamSet<(Query<&mut Transform, With<Camera3d>>, Query<&Transform>)>,
-) {
-    const SPEED: f32 = 2.0;
-    // if there is both a player and a bonus, target the mid-point of them
-    if let (Some(player_entity), Some(bonus_entity)) = (game.player.entity, game.bonus.entity) {
-        let transform_query = transforms.p1();
-        if let (Ok(player_transform), Ok(bonus_transform)) = (
-            transform_query.get(player_entity),
-            transform_query.get(bonus_entity),
-        ) {
-            game.camera_should_focus = player_transform
-                .translation
-                .lerp(bonus_transform.translation, 0.5);
-        }
-        // otherwise, if there is only a player, target the player
-    } else if let Some(player_entity) = game.player.entity {
-        if let Ok(player_transform) = transforms.p1().get(player_entity) {
-            game.camera_should_focus = player_transform.translation;
-        }
-        // otherwise, target the middle
-    } else {
-        game.camera_should_focus = Vec3::from(RESET_FOCUS);
-    }
-    // calculate the camera motion based on the difference between where the camera is looking
-    // and where it should be looking; the greater the distance, the faster the motion;
-    // smooth out the camera movement using the frame time
-    let mut camera_motion = game.camera_should_focus - game.camera_is_focus;
-    if camera_motion.length() > 0.2 {
-        camera_motion *= SPEED * time.delta_seconds();
-        // set the new camera's actual focus
-        game.camera_is_focus += camera_motion;
-    }
-    // look at that new camera's actual focus
-    for mut transform in transforms.p0().iter_mut() {
-        *transform = transform.looking_at(game.camera_is_focus, Vec3::Y);
-    }
-}
+    // Because we need to round the number of columns,
+    // the space on the top and sides of the bricks only captures a lower bound, not an exact value
+    let center_of_bricks = (LEFT_WALL + RIGHT_WALL) / 2.0;
+    let left_edge_of_bricks = center_of_bricks
+        // Space taken up by the bricks
+        - (n_columns as f32 / 2.0 * BRICK_SIZE.x)
+        // Space taken up by the gaps
+        - n_vertical_gaps as f32 / 2.0 * GAP_BETWEEN_BRICKS;
 
-// despawn the bonus if there is one, then spawn a new one at a random location
-fn spawn_bonus(
-    time: Res<Time>,
-    mut timer: ResMut<BonusSpawnTimer>,
-    mut next_state: ResMut<NextState<GameState>>,
-    mut commands: Commands,
-    mut game: ResMut<Game>,
-) {
-    // make sure we wait enough time before spawning the next cake
-    if !timer.0.tick(time.delta()).finished() {
-        return;
-    }
+    // In Bevy, the `translation` of an entity describes the center point,
+    // not its bottom-left corner
+    let offset_x = left_edge_of_bricks + BRICK_SIZE.x / 2.;
+    let offset_y = bottom_edge_of_bricks + BRICK_SIZE.y / 2.;
 
-    if let Some(entity) = game.bonus.entity {
-        game.score -= 3;
-        commands.entity(entity).despawn_recursive();
-        game.bonus.entity = None;
-        if game.score <= -5 {
-            next_state.set(GameState::GameOver);
-            return;
-        }
-    }
+    for row in 0..n_rows {
+        for column in 0..n_columns {
+            let brick_position = Vec2::new(
+                offset_x + column as f32 * (BRICK_SIZE.x + GAP_BETWEEN_BRICKS),
+                offset_y + row as f32 * (BRICK_SIZE.y + GAP_BETWEEN_BRICKS),
+            );
 
-    // ensure bonus doesn't spawn on the player
-    loop {
-        game.bonus.i = rand::thread_rng().gen_range(0..BOARD_SIZE_I);
-        game.bonus.j = rand::thread_rng().gen_range(0..BOARD_SIZE_J);
-        if game.bonus.i != game.player.i || game.bonus.j != game.player.j {
-            break;
-        }
-    }
-    game.bonus.entity = Some(
-        commands
-            .spawn(SceneBundle {
-                transform: Transform::from_xyz(
-                    game.bonus.i as f32,
-                    game.board[game.bonus.j][game.bonus.i].height + 0.2,
-                    game.bonus.j as f32,
-                ),
-                scene: game.bonus.handle.clone(),
-                ..default()
-            })
-            .with_children(|children| {
-                children.spawn(PointLightBundle {
-                    point_light: PointLight {
-                        color: Color::rgb(1.0, 1.0, 0.0),
-                        intensity: 1000.0,
-                        range: 10.0,
+            // brick
+            commands.spawn((
+                SpriteBundle {
+                    sprite: Sprite {
+                        color: BRICK_COLOR,
                         ..default()
                     },
-                    transform: Transform::from_xyz(0.0, 2.0, 0.0),
+                    transform: Transform {
+                        translation: brick_position.extend(0.0),
+                        scale: Vec3::new(BRICK_SIZE.x, BRICK_SIZE.y, 1.0),
+                        ..default()
+                    },
                     ..default()
-                });
-            })
-            .id(),
-    );
-}
-
-// let the cake turn on itself
-fn rotate_bonus(game: Res<Game>, time: Res<Time>, mut transforms: Query<&mut Transform>) {
-    if let Some(entity) = game.bonus.entity {
-        if let Ok(mut cake_transform) = transforms.get_mut(entity) {
-            cake_transform.rotate_y(time.delta_seconds());
-            cake_transform.scale =
-                Vec3::splat(1.0 + (game.score as f32 / 10.0 * time.elapsed_seconds().sin()).abs());
+                },
+                Brick,
+                Collider,
+            ));
         }
     }
 }
 
-// update the score displayed during the game
-fn scoreboard_system(game: Res<Game>, mut query: Query<&mut Text>) {
-    let mut text = query.single_mut();
-    text.sections[0].value = format!("Sugar Rush: {}", game.score);
+fn move_paddle(
+    keyboard_input: Res<Input<KeyCode>>,
+    mut query: Query<&mut Transform, With<Paddle>>,
+) {
+    let mut paddle_transform = query.single_mut();
+    let mut direction = 0.0;
+
+    if keyboard_input.pressed(KeyCode::Left) {
+        direction -= 1.0;
+    }
+
+    if keyboard_input.pressed(KeyCode::Right) {
+        direction += 1.0;
+    }
+
+    // Calculate the new horizontal paddle position based on player input
+    let new_paddle_position = paddle_transform.translation.x + direction * PADDLE_SPEED * TIME_STEP;
+
+    // Update the paddle position,
+    // making sure it doesn't cause the paddle to leave the arena
+    let left_bound = LEFT_WALL + WALL_THICKNESS / 2.0 + PADDLE_SIZE.x / 2.0 + PADDLE_PADDING;
+    let right_bound = RIGHT_WALL - WALL_THICKNESS / 2.0 - PADDLE_SIZE.x / 2.0 - PADDLE_PADDING;
+
+    paddle_transform.translation.x = new_paddle_position.clamp(left_bound, right_bound);
 }
 
-// restart the game when pressing spacebar
-fn gameover_keyboard(
-    mut next_state: ResMut<NextState<GameState>>,
-    keyboard_input: Res<Input<KeyCode>>,
-) {
-    if keyboard_input.just_pressed(KeyCode::Space) {
-        next_state.set(GameState::Playing);
+fn apply_velocity(mut query: Query<(&mut Transform, &Velocity)>) {
+    for (mut transform, velocity) in &mut query {
+        transform.translation.x += velocity.x * TIME_STEP;
+        transform.translation.y += velocity.y * TIME_STEP;
     }
 }
 
-// display the number of cake eaten before losing
-fn display_score(mut commands: Commands, asset_server: Res<AssetServer>, game: Res<Game>) {
-    commands
-        .spawn(NodeBundle {
-            style: Style {
-                size: Size::new(Val::Percent(100.0), Val::Percent(100.0)),
-                align_items: AlignItems::Center,
-                justify_content: JustifyContent::Center,
-                ..default()
-            },
-            ..default()
-        })
-        .with_children(|parent| {
-            parent.spawn(TextBundle::from_section(
-                format!("Cake eaten: {}", game.cake_eaten),
-                TextStyle {
-                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
-                    font_size: 80.0,
-                    color: Color::rgb(0.5, 0.5, 1.0),
-                },
-            ));
-        });
+fn update_scoreboard(board: Res<Board>, mut query: Query<&mut Text>) {
+    let mut text = query.single_mut();
+    text.sections[1].value = board.score.to_string();
+}
+fn update_fps(board: Res<Board>) {
+    let mut _fps = board.fps;
+    _fps = 10;
+}
+
+fn check_for_collisions(
+    mut commands: Commands,
+    mut scoreboard: ResMut<Board>,
+    mut ball_query: Query<(&mut Velocity, &Transform), With<Ball>>,
+    collider_query: Query<(Entity, &Transform, Option<&Brick>), With<Collider>>,
+    mut collision_events: EventWriter<CollisionEvent>,
+) {
+    let (mut ball_velocity, ball_transform) = ball_query.single_mut();
+    let ball_size = ball_transform.scale.truncate();
+
+    // check collision with walls
+    for (collider_entity, transform, maybe_brick) in &collider_query {
+        let collision = collide(
+            ball_transform.translation,
+            ball_size,
+            transform.translation,
+            transform.scale.truncate(),
+        );
+        if let Some(collision) = collision {
+            // Sends a collision event so that other systems can react to the collision
+            collision_events.send_default();
+
+            // Bricks should be despawned and increment the scoreboard on collision
+            if maybe_brick.is_some() {
+                scoreboard.score += 1;
+                commands.entity(collider_entity).despawn();
+            }
+
+            // reflect the ball when it collides
+            let mut reflect_x = false;
+            let mut reflect_y = false;
+
+            // only reflect if the ball's velocity is going in the opposite direction of the
+            // collision
+            match collision {
+                Collision::Left => reflect_x = ball_velocity.x > 0.0,
+                Collision::Right => reflect_x = ball_velocity.x < 0.0,
+                Collision::Top => reflect_y = ball_velocity.y < 0.0,
+                Collision::Bottom => reflect_y = ball_velocity.y > 0.0,
+                Collision::Inside => { /* do nothing */ }
+            }
+
+            // reflect velocity on the x-axis if we hit something on the x-axis
+            if reflect_x {
+                ball_velocity.x = -ball_velocity.x;
+            }
+
+            // reflect velocity on the y-axis if we hit something on the y-axis
+            if reflect_y {
+                ball_velocity.y = -ball_velocity.y;
+            }
+        }
+    }
+}
+
+fn play_collision_sound(
+    mut collision_events: EventReader<CollisionEvent>,
+    audio: Res<Audio>,
+    sound: Res<CollisionSound>,
+) {
+    // Play a sound once per frame if a collision occurred.
+    if !collision_events.is_empty() {
+        // This prevents events staying active on the next frame.
+        collision_events.clear();
+        audio.play(sound.0.clone());
+    }
 }
